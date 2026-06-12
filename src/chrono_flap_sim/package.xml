@@ -16,6 +16,12 @@
   <depend>std_srvs</depend>
   <depend>sensor_msgs</depend>
   <build_depend>odrive_velocity_pid</build_depend>
+  <!--
+    SEA-Stack (https://github.com/Project-SEA-Stack/SEA-Stack) is an OPTIONAL
+    build-time dependency. It is detected via find_package(SEAStack QUIET CONFIG)
+    in CMakeLists.txt; build with SEAStack_DIR exported to enable hydrodynamics.
+    No rosdep entry exists because SEA-Stack is not in rosdistro.
+  -->
 
   <exec_depend>robot_state_publisher</exec_depend>
   <exec_depend>xacro</exec_depend>
