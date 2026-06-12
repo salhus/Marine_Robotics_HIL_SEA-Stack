@@ -1,0 +1,524 @@
+# chrono_flap_sim
+
+ROS 2 C++ package that runs a **Project Chrono** multibody simulation of an inverted-pendulum
+flap on a revolute joint. The node supports three operating modes — **SIL** (Software-in-the-Loop,
+no hardware required), **parallel/shadow** (runs alongside real ODrive hardware for model
+validation), and **HIL** (Hardware-in-the-Loop: real motor + encoder + controller form the
+primary loop; Chrono evaluates a hydrodynamic load torque from measured state) — and exposes
+all physical parameters for online reconfiguration via `rqt_reconfigure`.
+
+In both SIL and parallel modes, the node runs an internal **shadow PID controller** that closes the
+simulation loop using `sim_position` / `sim_velocity` as feedback, mirroring the exact same
+cascade/position-only/velocity-only logic as `velocity_pid_node`.  This makes the simulation
+self-stabilising — any mismatch between sim and real is purely due to model error rather than
+open-loop instability.
+
+With `shadow_sync_trajectory=true` (the default in both modes), the shadow PID automatically
+subscribes to the `velocity_pid_node`'s published `/velocity_pid_node/position_command` and
+`/velocity_pid_node/velocity_command` topics and uses those as its reference.  This means you
+only set the trajectory in one place (the real controller) and both the hardware and Chrono shadow
+track the same reference automatically.
+
+In parallel mode the node also publishes `/sim_joint_states` so a second `robot_state_publisher`
+can drive a `sim/`-prefixed TF tree.  This lets you overlay **both** the real hardware flap and
+the Chrono sim flap in RViz simultaneously.
+
+---
+
+## Overview
+
+### Physical setup
+
+- 30 cm × 30 cm × 0.25 cm acrylic flap (~0.5 kg identified mass)
+- Pivot at the **bottom edge** (inverted pendulum — flap stands upright)
+- Gravity acts in −Z; revolute joint rotates about the Y axis
+- **Powered ODrive** on one end of the pivot axis drives the flap
+- **Unpowered ODrive** on the other end acts as a passive bearing with friction
+
+### Operating modes
+
+| Mode | `mode` param | `sil_mode` | Publishes `/joint_states` | Writes to `/motor_effort_controller/commands` | `use_shadow_pid` / `shadow_sync_trajectory` | Load-model feedback | Role |
+|---|---|---|---|---|---|---|---|
+| **SIL** | `"sil"` | `true` | ✓ at `rate_hz` | ✗ (torque output is comparison only) | ✓ applies | Chrono integration | Acts as the plant; shadow PID drives Chrono, `velocity_pid_node` torque available for comparison |
+| **Parallel** | `"parallel"` (default) | `false` | ✗ | ✗ | ✓ applies | Chrono integration from cmd + observer | Shadows the real hardware; publishes `~/sim_*` for comparison |
+| **HIL** | `"hil"` | N/A | ✗ | ✗ (mixer does) | ✗ forced off | Real `/joint_states` (θ_meas, ω_meas) | Evaluates τ_hydro from measured state; publishes `~/load_torque`; no Chrono dynamics integration for control |
+
+The legacy `sil_mode` bool is kept for backward compatibility: if `mode` is unset, `sil_mode=true`
+selects SIL and `sil_mode=false` selects parallel. If both are set and inconsistent, `mode` wins.
+
+---
+
+## Physics model
+
+The flap is modelled as a thin rectangular plate pivoting at its bottom edge (inverted pendulum).
+
+### Inertia
+
+For a uniform rectangular plate of mass *m* and height *L*, with the pivot at the bottom edge:
+
+```
+I_pivot = (1/3) · m · L²
+```
+
+### Torque law
+
+Each solver sub-step applies:
+
+```
+τ_total = τ_external − (B_joint + B_bearing) · ω − C_coulomb · sign(ω) − K · θ
+```
+
+| Symbol | Parameter | Description |
+|---|---|---|
+| `τ_external` | — | Torque from `velocity_pid_node` via the effort topic (N·m) |
+| `B_joint` | `joint_damping` | Viscous damping at the powered ODrive joint (N·m·s/rad) |
+| `B_bearing` | `bearing_friction` | Bearing friction at the unpowered ODrive (N·m·s/rad) |
+| `C_coulomb` | `coulomb_friction` | Coulomb (dry) friction magnitude (N·m); constant braking force opposing motion at all speeds |
+| `K` | `joint_stiffness` | Restoring spring stiffness (N·m/rad); models cable/structural stiffness |
+| `ω` | — | Instantaneous joint angular velocity (rad/s) |
+| `θ` | — | Joint angle measured from upright equilibrium (rad) |
+
+Gravity is handled by Project Chrono through the rigid-body simulation; it does not appear
+explicitly in the torque law above.
+
+---
+
+## Operating modes
+
+### SIL mode (`sil_mode:=true`)
+
+`chrono_flap_node` publishes `sensor_msgs/JointState` on `/joint_states`, replacing
+`joint_state_broadcaster`. The shadow PID drives the Chrono plant using the trajectory synced
+from `velocity_pid_node`. The `velocity_pid_node` still computes torque from `/joint_states`
+feedback, but its torque output is for **comparison only** — plot `~/shadow_torque` vs
+`/motor_effort_controller/commands` for an apples-to-apples controller comparison. No ODrive,
+CAN bus, or motor is needed.
+
+```
+velocity_pid_node (trajectory generator)
+  │  ~/position_command    ~/velocity_command
+  ▼                        ▼
+chrono_flap_node (shadow PID drives Chrono plant)
+  │  /joint_states ──▶ velocity_pid_node (torque output = compare against ~/shadow_torque)
+```
+
+**Typical launch:**
+
+The easiest way to start SIL mode is the dedicated launch file, which starts
+`robot_state_publisher`, `chrono_flap_node` (with `sil_mode:=true`), and `velocity_pid_node`
+together:
+
+```bash
+ros2 launch chrono_flap_sim sil_mode.launch.py
+```
+
+Optional arguments:
+
+```bash
+ros2 launch chrono_flap_sim sil_mode.launch.py \
+  bearing_friction:=0.3 \
+  control_mode:=cascade \
+  position_setpoint:=0.8 \
+  enable_visualization:=false
+```
+
+### RViz visualization (SIL mode)
+
+With the launch file running, open RViz in a second terminal to visualize the robot model:
+
+```bash
+# In a second terminal
+rviz2
+```
+
+In RViz:
+
+1. Set **Fixed Frame** to `base_link`
+2. **Add** → **RobotModel** → set **Description Source** to "Topic" and **Description Topic** to `/robot_description`
+3. **Add** → **TF** (optional, to see frame axes)
+
+The URDF includes visual geometry for two links: grey `base_link` cube and blue translucent
+`motor_link` flap (0.0025 m thick × 0.30 m wide × 0.30 m tall, swings in the XZ plane about
+the Y axis with the pivot at the bottom edge).
+
+### Alternative: manual launch (two terminals)
+
+```bash
+# Terminal 1 — simulation plant
+ros2 run chrono_flap_sim chrono_flap_node --ros-args \
+  -p sil_mode:=true \
+  -p bearing_friction:=0.4 \
+  -p joint_stiffness:=0.712441
+
+# Terminal 2 — PID controller
+ros2 run odrive_velocity_pid velocity_pid_node --ros-args \
+  -p joint_name:=motor_joint \
+  -p control_mode:=cascade \
+  -p position_setpoint:=0.5
+```
+
+### Apples-to-apples torque comparison (SIL mode)
+
+With `shadow_sync_trajectory=true` (the default), the shadow PID drives the Chrono plant using
+the same trajectory references as `velocity_pid_node`. Both controllers see identical trajectory
+references and the same plant feedback (`/joint_states`), so you can compare their torque outputs
+directly:
+
+| Topic | Source | Description |
+|---|---|---|
+| `~/shadow_torque` | Shadow PID (drives the plant) | Internal PID torque command |
+| `/motor_effort_controller/commands` | `velocity_pid_node` | External controller torque (comparison) |
+| `~/sim_position` | Chrono plant | Sim state — same feedback for both controllers |
+| `~/sim_velocity` | Chrono plant | Sim state — same feedback for both controllers |
+
+```bash
+# Verify sim is running (not stuck at 0)
+ros2 topic hz /joint_states
+ros2 topic echo /chrono_flap_node/sim_position --once
+
+# Compare torques
+ros2 topic echo /chrono_flap_node/shadow_torque --once
+ros2 topic echo /motor_effort_controller/commands --once
+```
+
+### Parallel mode (`sil_mode:=false`, default)
+
+The real ODrive owns `/joint_states`. `chrono_flap_node` subscribes to the same torque command
+the hardware receives and integrates the equations of motion, publishing its predictions on
+`~/sim_*` topics. Compare these against real hardware measurements in PlotJuggler to validate
+the identified parameters.
+
+#### Shadow PID mode (`use_shadow_pid:=true`, default)
+
+Instead of injecting the real controller torque open-loop into Chrono, the node runs an internal
+**shadow PID controller** that generates its own torque from `sim_position` / `sim_velocity`.
+This makes the simulation inherently closed-loop stable.  Any divergence from the real hardware
+trajectory indicates model error (mass, friction, stiffness) rather than open-loop instability.
+
+The shadow PID supports all three control modes (`position_only`, `cascade`, `velocity_only`) and
+generates the same sine trajectory as `velocity_pid_node`.  All gains are prefixed with
+`shadow_` to avoid collision with the real controller's parameters and are fully
+runtime-reconfigurable via `rqt_reconfigure`.
+
+**Trajectory synchronisation (`shadow_sync_trajectory:=true`, default in both modes):**
+Instead of duplicating `shadow_position_setpoint`, `shadow_amplitude_rad_s`, and
+`shadow_omega_rad_s` params, the shadow PID subscribes to:
+- `/velocity_pid_node/position_command` → used as `pos_ref`
+- `/velocity_pid_node/velocity_command` → used as velocity feedforward / `vel_ref`
+
+This way you only change the trajectory in the real controller and both hardware and Chrono
+automatically track the same reference.  The shadow PID gains (`shadow_kp`, `shadow_ki`, etc.)
+remain independent.
+
+`shadow_sync_trajectory=true` works in both SIL and parallel modes. In SIL mode, the shadow PID
+syncs trajectory from `velocity_pid_node`'s `~/position_command` and `~/velocity_command` and
+drives the plant, while `velocity_pid_node`'s actual torque output serves as a comparison
+baseline. There is no circular dependency because the trajectory references come from
+`velocity_pid_node`'s internal generator, not from `/joint_states` feedback.
+
+```
+ODrive HW ──/joint_states──▶ velocity_pid_node ──/motor_effort_controller/commands──▶ ODrive HW
+                               │  ~/position_command ──▶ chrono_flap_node (pos_ref)
+                               │  ~/velocity_command ──▶ chrono_flap_node (vel_ref)
+                             chrono_flap_node (sil_mode=false, use_shadow_pid=true,
+                                              shadow_sync_trajectory=true)
+                               shadow PID ──▶ Chrono plant (closed-loop)
+                               ~/sim_position, ~/sim_velocity, ~/sim_acceleration, ~/shadow_torque
+                               /sim_joint_states ──▶ sim_robot_state_publisher (RViz overlay)
+```
+
+#### Open-loop mode (`use_shadow_pid:=false`)
+
+The torque command received from the real controller is injected directly into Chrono.
+This is the legacy behaviour.
+
+```
+ODrive HW ──▶ velocity_pid_node ──/motor_effort_controller/commands──▶ ODrive HW
+                                                │
+                                                ▼
+                              chrono_flap_node (use_shadow_pid=false)
+                              ~/sim_position, ~/sim_velocity, ~/sim_acceleration
+```
+
+**Typical launch (via launch file):**
+
+```bash
+ros2 launch hil_odrive_ros2_control parallel_mode.launch.py
+```
+
+The launch file starts `chrono_flap_node` automatically in parallel mode. To enable the 3D
+visualization window:
+
+```bash
+ros2 launch hil_odrive_ros2_control parallel_mode.launch.py enable_visualization:=true
+```
+
+---
+
+## 3D Visualization (VSG)
+
+When built with VSG support, `chrono_flap_node` can render the live
+Chrono multibody scene in a window. The visualization is **off by
+default** — enable per-launch:
+
+```bash
+ros2 launch chrono_flap_sim sil_mode.launch.py enable_visualization:=true
+# or, with hardware:
+ros2 launch hil_odrive_ros2_control parallel_mode.launch.py enable_visualization:=true
+ros2 launch hil_odrive_ros2_control hil_mode.launch.py      enable_visualization:=true
+```
+
+If the visualization is not what you expect (window doesn't open, opens
+then crashes, missing assets), see [`../../docs/VSG_SETUP.md`](../../docs/VSG_SETUP.md)
+for the complete setup procedure, env-var reference, and troubleshooting
+matrix. VSG needs three separate env vars (`CMAKE_PREFIX_PATH`,
+`LD_LIBRARY_PATH`, `VSG_FILE_PATH`) covering three independent discovery
+stages.
+
+---
+
+## Parameters
+
+Parameters marked **Immutable** require a node restart; **Reconfigurable** parameters can be
+changed at runtime via `ros2 param set` or `rqt_reconfigure`.
+
+| Parameter | Type | Default | Reconfigurable | Description |
+|---|---|---|---|---|
+| `sil_mode` | bool | `false` | ✗ | Publish `sensor_msgs/JointState` on `/joint_states` for SIL closed-loop operation |
+| `joint_name` | string | `motor_joint` | ✗ | Joint name written into the `JointState` message |
+| `joint_state_topic` | string | `/joint_states` | ✗ | Topic on which `/joint_states` is published (SIL only) |
+| `rate_hz` | double | `100.0` | ✗ | Publish and control-loop rate (Hz) |
+| `solver_rate_hz` | double | `1000.0` | ✗ | Internal Chrono solver rate (Hz); solver runs `solver_rate_hz / rate_hz` sub-steps per publish tick |
+| `effort_topic` | string | `/motor_effort_controller/commands` | ✗ | Torque input topic (`std_msgs/Float64MultiArray`, first element used) |
+| `enable_visualization` | bool | `false` | ✗ | Enable Chrono 3D visualization window (requires a Chrono build with VSG or Irrlicht support) |
+| `flap_length_m` | double | `0.30` | ✓ | Flap height/length (m); updates pivot-to-CoM distance and inertia |
+| `flap_width_m` | double | `0.30` | ✓ | Flap width (m); updates inertia tensor |
+| `flap_mass_kg` | double | `0.21` | ✓ | Flap mass (kg) |
+| `joint_damping` | double | `0.0` | ✓ | Viscous damping at the powered ODrive joint (N·m·s/rad) |
+| `joint_stiffness` | double | `0.712441` | ✓ | Restoring spring stiffness (N·m/rad); identified value from parameter ID |
+| `bearing_friction` | double | `0.4` | ✓ | Bearing friction at the unpowered ODrive (N·m·s/rad); identified test-bench value |
+| `coulomb_friction` | double | `0.0` | ✓ | Coulomb (dry) friction magnitude (N·m); constant braking force applied as `coulomb_friction * sign(ω)`. |
+| `use_shadow_pid` | bool | `true` | ✓ | Use the internal closed-loop shadow PID to drive Chrono (`true`) or inject the real controller torque open-loop (`false`) |
+
+### Shadow PID parameters
+
+All `shadow_*` parameters are runtime-reconfigurable. Set them to match the real controller's
+gains so the sim uses identical control logic.
+
+#### Trajectory synchronisation
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `shadow_sync_trajectory` | bool | `true` | Subscribe to `/velocity_pid_node/{position,velocity}_command` for shadow PID references instead of generating an internal sine trajectory. Works in both SIL and parallel modes. |
+| `shadow_control_mode` | string | `position_only` | Active control mode: `position_only`, `cascade`, or `velocity_only` |
+
+When `shadow_sync_trajectory=true` (default in both modes), the `shadow_position_setpoint`,
+`shadow_amplitude_rad_s`, and `shadow_omega_rad_s` parameters below are **ignored**.  Set
+trajectory parameters on `velocity_pid_node` only.
+
+#### Trajectory (used only when `shadow_sync_trajectory=false`)
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `shadow_position_setpoint` | double | `0.0` | Base position offset (rad) |
+| `shadow_amplitude_rad_s` | double | `0.0` | Sine velocity amplitude (rad/s) |
+| `shadow_omega_rad_s` | double | `0.0` | Sine angular frequency (rad/s) |
+
+#### Inner loop (velocity PID)
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `shadow_kp` | double | `0.35` | Proportional gain |
+| `shadow_ki` | double | `0.01` | Integral gain |
+| `shadow_kd` | double | `0.00` | Derivative gain |
+| `shadow_kff` | double | `0.40` | Velocity feedforward gain |
+| `shadow_kaff` | double | `0.20` | Acceleration feedforward gain |
+| `shadow_torque_limit_nm` | double | `0.40` | Symmetric torque output clamp (N·m) |
+| `shadow_integral_limit` | double | `0.00` | Integral accumulator clamp (0 = unlimited) |
+| `shadow_deadband_rad_s` | double | `0.00` | Velocity error deadband (rad/s) |
+
+#### Outer loop (position PID, cascade mode only)
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `shadow_kp_pos` | double | `2.00` | Proportional gain |
+| `shadow_ki_pos` | double | `0.01` | Integral gain |
+| `shadow_kd_pos` | double | `0.025` | Derivative gain |
+| `shadow_pos_integral_limit` | double | `1.00` | Integral accumulator clamp |
+| `shadow_pos_output_limit` | double | `2.00` | Velocity command output clamp (rad/s) |
+
+#### Misc
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `shadow_outer_loop_divider` | double | `1.0` | Run outer position loop every N inner ticks |
+| `shadow_filter_alpha` | double | `0.90` | IIR velocity filter coefficient in [0.0, 1.0) |
+
+> **Identified values:** For the 30 cm × 30 cm acrylic flap on this test bench, the parameter
+> identification results are:
+>
+> | Parameter | Default (code) | Identified hardware value |
+> |---|---|---|
+> | `flap_mass_kg` | `0.21` | 0.21 kg |
+> | `joint_stiffness` | `0.712441` | 0.712441 N·m/rad |
+> | `bearing_friction` | `0.4` | **0.2 N·m·s/rad** |
+> | `joint_damping` | `0.0` | 0.0 N·m·s/rad |
+>
+> Always pass `bearing_friction:=0.4` (the current default) when running on this hardware.
+> See the root [`README.md`](../../README.md#identified-plant-parameters) for the full parameter identification table.
+
+---
+
+## Published topics
+
+| Topic | Type | Condition | Description |
+|---|---|---|---|
+| `/joint_states` | `sensor_msgs/JointState` | SIL mode only (`sil_mode=true`) | Simulated joint position and velocity for `motor_joint`; replaces `joint_state_broadcaster`, enabling `robot_state_publisher` to compute TFs |
+| `/sim_joint_states` | `sensor_msgs/JointState` | Parallel and HIL modes (`sil_mode=false`) | Simulated joint position for `motor_joint` only; consumed by the second `robot_state_publisher` (namespace `sim`, `frame_prefix='sim/'`) to drive the sim TF tree for RViz overlay |
+| `~/sim_position` | `std_msgs/Float64` | Always | Simulated joint angle (rad); in HIL mode this passes through the measured θ |
+| `~/sim_velocity` | `std_msgs/Float64` | Always | Simulated joint angular velocity (rad/s); in HIL mode passes through the measured ω |
+| `~/sim_acceleration` | `std_msgs/Float64` | Always | Simulated joint angular acceleration (rad/s²); in HIL mode computed as Δω/Δt |
+| `~/shadow_torque` | `std_msgs/Float64` | SIL and Parallel modes | Torque command applied to Chrono (shadow PID output when `use_shadow_pid=true`, else `0.0`) |
+| `~/load_torque` | `std_msgs/Float64` | HIL mode only | Hydrodynamic load torque τ_hydro evaluated from measured (θ, ω); published to `hil_torque_mixer_node` |
+
+All `~/` topics are scoped under the node name (e.g. `/chrono_flap_node/sim_position`).
+
+---
+
+## Subscribed topics
+
+| Topic | Type | Condition | Description |
+|---|---|---|---|
+| `/motor_effort_controller/commands` | `std_msgs/Float64MultiArray` | Always | Torque input from real controller (N·m); used when `use_shadow_pid=false` |
+| `/velocity_pid_node/position_command` | `std_msgs/Float64` | `shadow_sync_trajectory=true` (both modes) | Position reference for shadow PID synced from the real controller |
+| `/velocity_pid_node/velocity_command` | `std_msgs/Float64` | `shadow_sync_trajectory=true` (both modes) | Velocity feedforward reference for shadow PID synced from the real controller |
+
+---
+
+## Dual RViz flap overlay (parallel mode)
+
+When running in parallel mode, `parallel_mode.launch.py` starts a second `robot_state_publisher`
+(in the `sim` namespace) that loads `motor_sim.urdf.xacro` (orange semi-transparent flap) and
+subscribes to `/sim_joint_states`. A `static_transform_publisher` publishes an identity transform
+from `base_link` → `sim/base_link`, overlaying the sim TF tree exactly on the real hardware tree.
+
+> **RViz2 quirk:** Two RobotModel displays with identical URDFs share internal mesh/material
+> resources and the second one won't render visuals. That is why `motor_sim.urdf.xacro` uses
+> different material names (orange, semi-transparent) — it is otherwise identical geometry.
+
+To see both flaps in RViz simultaneously:
+
+1. Launch the full hardware stack: `ros2 launch hil_odrive_ros2_control parallel_mode.launch.py`
+2. Open RViz2 and set **Fixed Frame** to `base_link`
+3. Add first **RobotModel** display:
+   - Description Topic = `/robot_description`, no TF Prefix → real hardware flap (blue)
+4. Add second **RobotModel** display:
+   - Description Topic = `/sim/robot_description`, TF Prefix = `sim/`, Alpha = 0.5 → Chrono sim flap (orange)
+5. Add a **TF** display (optional) to see all frame axes (`motor_link`, `sim/motor_link`, etc.)
+
+When the sim model is accurate the two flaps overlap. When they diverge, you can see the error
+visually — useful for model validation and presentations.
+
+---
+
+## PlotJuggler comparison (parallel mode)
+
+After launching the full hardware stack, subscribe to the following topics in PlotJuggler to
+compare the Chrono shadow prediction against real measurements:
+
+| Simulated (Chrono) | Real (hardware) | Description |
+|---|---|---|
+| `/chrono_flap_node/sim_position` | `/velocity_pid_node/measured_position` | Joint angle (rad) |
+| `/chrono_flap_node/sim_velocity` | `/velocity_pid_node/measured_velocity` | Joint velocity (rad/s) |
+| `/chrono_flap_node/shadow_torque` | `/velocity_pid_node/` (torque pub) | Torque commands (compare when `use_shadow_pid=true`) |
+
+When `use_shadow_pid=true`, divergence in position/velocity traces indicates model error
+(inertia, friction, stiffness) rather than open-loop instability — much easier to diagnose.
+
+---
+
+## Prerequisites
+
+- [Project Chrono](https://projectchrono.org) — core library (`ChronoEngine`).
+  Optional: VSG (`Chrono_vsg`) module for 3D visualization — see
+  [`../../docs/VSG_SETUP.md`](../../docs/VSG_SETUP.md) for setup. Irrlicht
+  (`Chrono_irrlicht`) is also supported by the build system but is
+  incompatible with C++20 in version 1.8.
+- ROS 2 Jazzy (or compatible).
+- `odrive_velocity_pid` package (provides `pid_controller.hpp`; built as a sibling package).
+
+---
+
+## Building
+
+```bash
+# Build both packages (odrive_velocity_pid provides pid_controller.hpp):
+colcon build --packages-select odrive_velocity_pid chrono_flap_sim hil_torque_mixer
+
+# With VSG visualization — export the three VSG env vars first
+# (see ../../docs/VSG_SETUP.md), then a plain colcon build picks them up:
+colcon build --packages-select odrive_velocity_pid chrono_flap_sim hil_torque_mixer
+```
+
+`CMakeLists.txt` detects the VSG headers and libraries from
+`CMAKE_PREFIX_PATH` (both the CMake variable and the environment
+variable — colcon passes it via the env var, so both are honored). When
+VSG is available the build defines `CHRONO_FLAP_USE_VSG` and links
+against `libChrono_vsg`, `libvsg`, and `libvsgXchange`. When VSG is
+unavailable the build cleanly falls back to headless without errors. See
+[`../../docs/VSG_SETUP.md`](../../docs/VSG_SETUP.md) for the full
+setup, env-var reference, and troubleshooting matrix.
+
+---
+
+## HIL mode
+
+See [`doc/hil_mode.md`](doc/hil_mode.md) for the full design document, causality diagram,
+commissioning procedure, and HydroChrono integration plan.
+
+### Quick start
+
+```bash
+ros2 launch hil_odrive_ros2_control hil_mode.launch.py
+```
+
+Then engage the load torque:
+
+```bash
+ros2 service call /chrono_flap_node/engage_hil std_srvs/srv/SetBool "{data: true}"
+```
+
+### HIL parameters
+
+| Parameter | Default | Mutable | Description |
+|---|---|---|---|
+| `hil_constant_load_nm` | `0.1` | ✓ | Stub constant load torque bias (N·m) |
+| `hil_virtual_stiffness` | `0.0` | ✓ | Virtual spring stiffness (N·m/rad), ≥ 0 |
+| `hil_virtual_damping` | `0.0` | ✓ | Virtual damping (N·m·s/rad), ≥ 0 |
+| `hil_quadratic_drag` | `0.0` | ✓ | Quadratic drag coefficient, ≥ 0 |
+| `hil_wave_amp_nm` | `0.0` | ✓ | Wave excitation amplitude (N·m), ≥ 0 |
+| `hil_wave_omega_rad_s` | `0.0` | ✓ | Wave excitation frequency (rad/s), ≥ 0 |
+| `hil_torque_clip_nm` | `0.3` | ✓ | Hard clamp on τ_hydro published by this node (N·m), > 0 |
+| `hil_feedback_timeout_s` | `0.1` | ✓ | Watchdog timeout on /joint_states freshness (s), > 0 |
+| `hil_ramp_time_s` | `1.0` | ✓ | Ramp-in time when engaging (s), ≥ 0 |
+| `hil_engaged_default` | `false` | ✗ | Whether to engage load torque at startup (default false for safety) |
+| `hil_load_topic` | `~/load_torque` | ✗ | Topic on which τ_hydro is published |
+
+### HIL service
+
+| Service | Type | Description |
+|---|---|---|
+| `~/engage_hil` | `std_srvs/SetBool` | Engage (`data: true`) or disengage (`data: false`) the load torque with ramp-in |
+
+### Note on HydroChrono swap-in
+
+To replace the stub with a full HydroChrono / SeaStack model, only the body of
+`compute_load_torque(double theta, double omega, double t)` in `chrono_flap_node.cpp` needs
+to change. All topics, watchdogs, safety logic, and the engage service remain unchanged.
+
+### Note on future active PTO (axis1)
+
+When axis1 becomes active, only the mixer's `output_topic` parameter changes (or the load
+torque is published directly to axis1's effort topic and the mixer is bypassed for axis1).
+No logic changes in `chrono_flap_node`.
+

@@ -1,0 +1,589 @@
+# hil_odrive_ros2_control (ROS 2 Jazzy)
+
+This repository is a self-contained ROS 2 Jazzy workspace implementing a **Wave Energy Converter (WEC) Hardware-in-the-Loop (HIL) dynamometer** test bench. Two ODrive motors on a shared shaft are controlled over **SocketCAN (CAN bus)** via **ros2_control**:
+
+- **Motor 1 (Hydro Emulator, axis0, `node_id=0`)** — driven by `velocity_pid_node` to replay wave-driven shaft motion (sine-wave velocity trajectory)
+- **Motor 2 (PTO / Power Take-Off, axis1, `node_id=1`)** — passively resists shaft motion with `τ = -B · ω`. In Phase 1 the ODrive's onboard velocity controller handles the damping; no extra ROS control node is needed.
+
+It is designed so you can:
+
+- clone this repo into a fresh ROS 2 Jazzy workspace (`~/ws/src`)
+- `colcon build`
+- launch `ros2_control_node` + controllers
+- run the velocity PID node and command the hydro emulator motor
+
+---
+
+## WEC HIL dyno concept
+
+```
+                    ┌─────────────────────┐
+  can0 ◄───────────┤   ODrive (1 board)   │
+                    │                     │
+                    │  axis0 (node_id=0)  │──── Motor 1: Hydro Emulator (motor_joint)
+                    │                     │         ║
+                    │                     │     shared shaft
+                    │                     │         ║
+                    │  axis1 (node_id=1)  │──── Motor 2: PTO passive damper (pto_joint)
+                    └─────────────────────┘
+```
+
+Both motors share the same ODrive board and CAN bus (`can0`). The second joint (`pto_joint`) is registered inside the same `<ros2_control name="ODriveSystem">` hardware block in the URDF.
+
+> **Note:** `pto_joint` (axis1) is shown above for conceptual completeness. It is currently **commented out** in `motor.urdf.xacro` and the `pto_effort_controller` spawner has been removed from the launch file. Only `motor_joint` (axis0) is active in the current configuration.
+
+---
+
+## What's in this repo
+
+### Packages
+
+- **`hil_odrive_ros2_control`** (root package)
+  - Purpose: installs the launch files, controller YAML, and URDF/Xacro for `motor_joint` (axis0). `pto_joint` (axis1) is defined in the URDF but currently commented out.
+  - Key paths:
+    - `launch/parallel_mode.launch.py` — canonical parallel-mode launcher with tooling
+    - `launch/hil_mode.launch.py` — HIL mode: real HW + velocity_pid_node + chrono_flap_node (mode=hil) + hil_torque_mixer + tooling
+    - `config/controllers.yaml`
+    - `description/urdf/motor.urdf.xacro` (real hardware — blue flap)
+    - `description/urdf/motor_sim.urdf.xacro` (sim overlay — orange semi-transparent flap, different material names to work around RViz2 resource-sharing bug)
+
+- **`odrive_velocity_pid`** (package)
+  - Purpose: reads measured velocity from `/joint_states`, tracks a sine-wave reference velocity for `motor_joint`, runs a PID loop, and publishes torque (effort) commands
+
+### Upstream ODrive packages
+
+The following packages are sourced from the upstream [`odriverobotics/ros_odrive`](https://github.com/odriverobotics/ros_odrive) repository and live under `src/` as sibling colcon packages:
+
+- `src/odrive_ros2_control` (ros2_control hardware interface plugin)
+- `src/odrive_base` (base code used by the hardware plugin)
+
+See [`VENDORED.md`](VENDORED.md) for provenance and licensing details.
+
+---
+
+## High-level architecture / data flow
+
+### Runtime components
+
+1. **`ros2_control_node`** (from `controller_manager`)
+   - loads the ODrive hardware plugin declared in the URDF
+   - exposes ros2_control state and command interfaces for `motor_joint` (axis0)
+
+2. **`joint_state_broadcaster`**
+   - publishes `sensor_msgs/msg/JointState` on `/joint_states`
+   - provides measured position and velocity feedback for `motor_joint`
+
+3. **`motor_effort_controller`**
+   - accepts `std_msgs/msg/Float64MultiArray` commands on `/motor_effort_controller/commands`
+   - forwards them to the ros2_control effort command interface for `motor_joint`
+
+4. **`robot_state_publisher`** (real hardware)
+   - loads `motor.urdf.xacro`, publishes `/robot_description`
+   - drives the `base_link` / `motor_link` TF tree from `/joint_states`
+
+5. **`sim_robot_state_publisher`** (namespace `sim`)
+   - loads `motor_sim.urdf.xacro` (orange semi-transparent flap), publishes `/sim/robot_description`
+   - drives the `sim/base_link` / `sim/motor_link` TF tree from `/sim_joint_states`
+
+6. **`static_transform_publisher`**
+   - publishes an identity transform from `base_link` → `sim/base_link` (zero offset)
+   - overlays the sim TF tree exactly on top of the real hardware TF tree
+
+7. **`odrive_velocity_pid/velocity_pid_node`**
+   - a **standalone ROS 2 node** (not a ros2_control controller plugin)
+   - subscribes to `/joint_states`
+   - extracts measured position and velocity for `motor_joint`
+   - generates a sine trajectory reference:  
+     **pos_ref(t) = position_setpoint + (A/ω)·(1 − cos(ω·t))**  
+     **vel_ref(t) = A·sin(ω·t)**  
+     **accel_ref(t) = A·ω·cos(ω·t)**
+   - runs a cascaded PID (configurable mode: `position_only`, `cascade`, or `velocity_only`)
+   - publishes torque command as `std_msgs/msg/Float64MultiArray` to `/motor_effort_controller/commands`
+   - also publishes `~/position_command` and `~/velocity_command` for shadow PID synchronisation
+
+8. **`chrono_flap_sim/chrono_flap_node`** (included in `parallel_mode.launch.py`)
+   - runs a Project Chrono inverted-pendulum flap simulation in **parallel/shadow** mode by default
+   - subscribes to `/motor_effort_controller/commands` and integrates the equations of motion
+   - publishes `~/sim_position`, `~/sim_velocity`, `~/sim_acceleration` for model validation
+   - publishes `/sim_joint_states` (`motor_joint` only) for the sim `robot_state_publisher` → RViz overlay
+   - runs an internal **shadow PID** that subscribes to `~/position_command` and `~/velocity_command`
+     from `velocity_pid_node` (`shadow_sync_trajectory=true` by default) so both hardware and sim
+     track the same reference automatically
+   - see [`src/chrono_flap_sim/README.md`](../chrono_flap_sim/README.md) for the full physics model and parameter reference
+
+### Data flow summary
+
+```
+/joint_states (position + velocity) → velocity_pid_node → /motor_effort_controller/commands (effort) → effort controller → ODrive ros2_control hardware plugin → CAN → ODrive axis0 (motor_joint)
+
+velocity_pid_node → ~/position_command, ~/velocity_command → chrono_flap_node (shadow PID sync)
+
+/motor_effort_controller/commands → chrono_flap_node (parallel mode) → ~/sim_position, ~/sim_velocity
+                                                                      → /sim_joint_states → sim_robot_state_publisher (sim/) → RViz overlay
+```
+
+Note: `velocity_pid_node` is a standalone node — it is **not** a ros2_control controller plugin.
+It reads from the joint state broadcaster's output topic and writes directly to the effort
+controller's command topic.
+
+In **HIL mode**, `velocity_pid_node`'s effort output is **remapped at launch time** from
+`/motor_effort_controller/commands` to `/velocity_pid_node/torque_command`. The
+`hil_torque_mixer_node` is the **only** node that writes to `/motor_effort_controller/commands`
+in HIL mode.
+
+### HIL mode data flow
+
+```
+/joint_states (encoder feedback)
+        │
+        ├──▶ velocity_pid_node ──/velocity_pid_node/torque_command────────────────────┐
+        │                                                                              │
+        └──▶ chrono_flap_node (mode=hil)                                             ▼
+               τ_hydro = f(θ_meas, ω_meas, t)                             hil_torque_mixer_node
+               ~/load_torque ─────────────────────────────────────▶    τ_total = clamp(
+                                                                           τ_pid + τ_hydro,
+                                                                           ±hard_clip_nm)
+                                                                                      │
+                                             /motor_effort_controller/commands ◄──────┘
+                                                                                      │
+                                                                               ODrive HW
+```
+
+> **SIL alternative:** For development without hardware, use the dedicated launch file:
+> ```bash
+> ros2 launch chrono_flap_sim sil_mode.launch.py
+> ```
+> This starts `robot_state_publisher`, `chrono_flap_node` (with `sil_mode:=true`), and
+> `velocity_pid_node` together — no ODrive, CAN bus, or motor required. See the root
+> [`README.md`](../../README.md#quick-start-sil-mode-no-hardware) for full details and RViz
+> visualization instructions.
+
+---
+
+## Launch files
+
+| Launch file | Mode | Description |
+|---|---|---|
+| `parallel_mode.launch.py` | Parallel | Canonical parallel-mode launcher. Launches rqt_reconfigure, PlotJuggler, and RViz2 by default. |
+| `hil_mode.launch.py` | HIL | HIL mode: real hardware + `velocity_pid_node` (effort topic remapped) + `chrono_flap_node` (mode=hil) + `hil_torque_mixer_node` + tooling. |
+
+All three launch files support the same tooling arguments:
+
+| Argument | Default | Description |
+|---|---|---|
+| `controllers_file` | `config/controllers.yaml` | Path to controller YAML |
+| `enable_visualization` | `false` | Enable Chrono 3D visualization window (requires Vulkan/GPU) |
+| `enable_rqt` | `true` | Launch `rqt_reconfigure` for live parameter editing |
+| `enable_plotjuggler` | `true` | Launch PlotJuggler for time-series plotting |
+| `enable_rviz` | `true` | Launch RViz2 for 3D visualization |
+| `rviz_config` | `""` | Path to `.rviz` config file (empty = defaults) |
+| `plotjuggler_layout` | `""` | Path to PlotJuggler `.xml` layout (empty = defaults) |
+
+Disable any tool: `ros2 launch hil_odrive_ros2_control parallel_mode.launch.py enable_rviz:=false`
+
+> **VSG visualization:** Passing `enable_visualization:=true` requires
+> Project Chrono to be built with VSG support and the three VSG env vars
+> (`CMAKE_PREFIX_PATH`, `LD_LIBRARY_PATH`, `VSG_FILE_PATH`) exported in
+> the shell you launch from. See [`../../docs/VSG_SETUP.md`](../../docs/VSG_SETUP.md)
+> for the complete setup procedure and troubleshooting.
+
+### HIL safety mechanisms
+
+`hil_mode.launch.py` engages safety at all levels:
+
+| Mechanism | Where | Behaviour |
+|---|---|---|
+| **Engage gate** | `chrono_flap_node` | Load torque starts at zero; engage via `ros2 service call /chrono_flap_node/engage_hil std_srvs/srv/SetBool "{data: true}"` |
+| **Ramp-in** | `chrono_flap_node` | When engaging, τ_hydro ramps linearly from 0 over `hil_ramp_time_s` (default 1.0 s) |
+| **Watchdog** | `chrono_flap_node` | If `/joint_states` goes stale for > `hil_feedback_timeout_s` (default 0.1 s), τ_hydro is forced to zero |
+| **Load clamp** | `chrono_flap_node` | τ_hydro is clamped to ±`hil_torque_clip_nm` (default 0.3 N·m) |
+| **Independent watchdogs** | `hil_torque_mixer_node` | PID input and load input each have separate timeout checks (default 0.2 s each) |
+| **Hard output clamp** | `hil_torque_mixer_node` | τ_total always clamped to ±`hard_clip_nm` (default 0.5 N·m) |
+| **Shutdown zero** | Both nodes | Final zero-command published on destructor |
+
+---
+
+## Prerequisites
+
+### ROS 2 Jazzy
+You must have ROS 2 Jazzy installed. Make sure you source it in every terminal before building/running:
+
+```bash
+source /opt/ros/jazzy/setup.bash
+```
+
+### ros2_control + controllers
+You need the controller manager and controllers installed (commonly via `ros-jazzy-ros2-control` and `ros-jazzy-ros2-controllers`).
+
+In particular, this repo expects an effort controller type:
+
+- `effort_controllers/JointGroupEffortController`
+
+If you see controller-type load failures, install the appropriate Jazzy packages and/or check available controller types (see troubleshooting).
+
+### SocketCAN + can-utils
+You need a Linux SocketCAN interface (e.g. `can0`). Helpful tools:
+
+```bash
+sudo apt-get install can-utils
+```
+
+---
+
+## SocketCAN setup (example)
+
+ODrive CAN bitrate depends on your configuration. Example with `250000` (250k):
+
+```bash
+# Bring interface down if it exists
+sudo ip link set can0 down 2>/dev/null || true
+
+# Configure bitrate and bring it up
+sudo ip link set can0 up type can bitrate 250000
+
+# Inspect interface state/details
+ip -details link show can0
+```
+
+Verify traffic:
+
+```bash
+candump can0
+```
+
+If `candump` shows nothing, common causes include: wrong bitrate, wiring/termination issues, ODrive not transmitting, or wrong interface name.
+
+---
+
+## Configuration you MUST check (CAN + node_ids)
+
+The ODrive hardware plugin configuration is in:
+
+- `description/urdf/motor.urdf.xacro`
+
+Key parameters:
+
+### CAN interface name
+```xml
+<param name="can">can0</param>
+```
+
+### ODrive CAN node IDs
+```xml
+<!-- Motor 1: Hydro Emulator (ODrive axis0) -->
+<joint name="motor_joint">
+  <param name="node_id">0</param>
+</joint>
+```
+
+Make sure:
+- your SocketCAN interface is actually `can0` (or change it)
+- ODrive `node_id=0` is axis0 (hydro emulator)
+
+---
+
+## PTO motor configuration (Phase 1 — passive linear damper)
+
+Configure ODrive axis1 directly via `odrivetool` so it resists shaft motion proportionally to velocity:
+
+```python
+# In odrivetool
+odrv0.axis1.controller.config.control_mode = ControlMode.VELOCITY_CONTROL
+odrv0.axis1.controller.config.vel_setpoint = 0
+odrv0.axis1.controller.config.vel_gain = B   # damping coefficient B (Nm·s/rad)
+odrv0.axis1.requested_state = AxisState.CLOSED_LOOP_CONTROL
+```
+
+The velocity controller's P-gain acts as damping coefficient `B`. When Motor 1 spins the shaft at ω, axis1 applies `τ = -B · ω`.
+
+### Power telemetry via ros2_control state interfaces
+
+The hardware plugin exposes `electrical_power` and `mechanical_power` state interfaces for both
+joints, populated from ODrive `Get_Powers` CAN broadcast messages. However, the ODrive does
+**not** broadcast these by default. Enable the broadcast rate via `odrivetool`:
+
+```python
+# In odrivetool — enable power telemetry broadcast on both axes (10 Hz)
+odrv0.axis0.config.can.get_powers_msg_rate_ms = 100
+odrv0.axis1.config.can.get_powers_msg_rate_ms = 100
+odrv0.save_configuration()
+```
+
+Once configured, `electrical_power` and `mechanical_power` will be non-NaN in `/dynamic_joint_states`.
+This replaces the need to probe `V_bus × I_bus` on the DC bus with an oscilloscope.
+
+---
+
+## Build (fresh workspace)
+
+```bash
+# Terminal
+source /opt/ros/jazzy/setup.bash
+
+mkdir -p ~/ws/src
+cd ~/ws/src
+git clone https://github.com/salhus/hil_odrive_ros2_control.git
+cd ..
+
+# Install dependencies
+rosdep install --from-paths src -y --ignore-src
+
+# Build (headless — no Chrono visualization)
+colcon build --symlink-install
+
+# Source overlay
+source install/setup.bash
+```
+
+If Project Chrono was built with VSG visualization support, export the
+three VSG env vars (`CMAKE_PREFIX_PATH`, `LD_LIBRARY_PATH`,
+`VSG_FILE_PATH`) before building — colcon will pick them up
+automatically, no `--cmake-args` are needed. See
+[`../../docs/VSG_SETUP.md`](../../docs/VSG_SETUP.md) for the full
+procedure.
+
+### Confirm packages are discoverable by colcon
+```bash
+colcon list
+```
+
+You should see packages like:
+- `hil_odrive_ros2_control`
+- `chrono_flap_sim`
+- `odrive_velocity_pid`
+- `odrive_ros2_control`
+- `odrive_base`
+
+---
+
+## Run: bring up ros2_control + controllers
+
+Launch the WEC HIL dyno setup (parallel mode with tooling):
+
+```bash
+source /opt/ros/jazzy/setup.bash
+source ~/ws/install/setup.bash
+
+ros2 launch hil_odrive_ros2_control parallel_mode.launch.py
+```
+
+Both launch files start:
+- `ros2_control_node`
+- `robot_state_publisher` (real hardware, `/robot_description`)
+- `sim_robot_state_publisher` (namespace `sim`, `/sim/robot_description`, loads `motor_sim.urdf.xacro`)
+- `static_transform_publisher` (identity: `base_link` → `sim/base_link`)
+- spawns/activates:
+  - `joint_state_broadcaster`
+  - `motor_effort_controller` (Motor 1, hydro emulator)
+- `velocity_pid_node`
+- `chrono_flap_node` (parallel/shadow mode)
+- `rqt_reconfigure`, `plotjuggler`, `rviz2` (each conditionally, default enabled)
+
+See the [Launch files](#launch-files) section above for all arguments.
+
+To enable the Chrono 3D visualization window:
+
+```bash
+ros2 launch hil_odrive_ros2_control parallel_mode.launch.py enable_visualization:=true
+```
+
+---
+
+## Verify: controllers, interfaces, feedback
+
+### Check controllers
+```bash
+ros2 control list_controllers
+```
+
+You want both of these to show as `active`:
+- `joint_state_broadcaster`
+- `motor_effort_controller`
+
+### Check hardware interfaces
+```bash
+ros2 control list_hardware_interfaces
+```
+
+Look for `motor_joint` interfaces, including state interfaces for
+`position`, `velocity`, `effort`, `electrical_power`, and `mechanical_power`.
+
+### Check feedback stream
+```bash
+ros2 topic echo /joint_states --once
+```
+
+Confirm:
+- `motor_joint` appears in `name: [...]`
+- `velocity: [...]` has a sensible value (not NaN)
+
+### Check power telemetry
+```bash
+ros2 topic echo /dynamic_joint_states
+```
+
+`electrical_power` and `mechanical_power` appear here (not on `/joint_states`) once the ODrive
+is configured to broadcast `Get_Powers` messages. See the
+[power telemetry configuration](#power-telemetry-via-ros2_control-state-interfaces) section.
+
+---
+
+## Run: velocity PID node (hydro emulator — sine trajectory → torque)
+
+In a second terminal:
+
+```bash
+source /opt/ros/jazzy/setup.bash
+source ~/ws/install/setup.bash
+
+ros2 run odrive_velocity_pid velocity_pid_node
+```
+
+The node starts in `cascade` mode with trajectory amplitude and frequency set to `0.0`
+(stationary). Override parameters with `--ros-args -p key:=value`:
+
+```bash
+ros2 run odrive_velocity_pid velocity_pid_node --ros-args \
+  -p control_mode:=cascade \
+  -p amplitude_rad_s:=0.25 \
+  -p omega_rad_s:=0.25 \
+  -p torque_limit_nm:=0.4
+```
+
+> **Architecture note:** `VelocityPidNode` is a **standalone ROS 2 node** — it is *not* a
+> ros2_control controller plugin. It subscribes to `/joint_states` for feedback and publishes
+> directly to the effort controller topic. This means it can be started, stopped, and tuned
+> independently of the controller manager.
+
+### Control modes
+
+| Mode | Description |
+|---|---|
+| `position_only` | Outer position PID → torque directly. Good for commissioning. |
+| `cascade` *(default)* | Outer position PID → velocity command → inner velocity PID → torque. Best for trajectory tracking. |
+| `velocity_only` | Single velocity PID loop. Backward-compatible flat-PID behaviour. |
+
+Switch mode at runtime:
+
+```bash
+ros2 param set /velocity_pid_node control_mode cascade
+```
+
+### PID node parameters (`odrive_velocity_pid`)
+
+#### Immutable (require node restart)
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `joint_state_topic` | string | `/joint_states` | JointState feedback topic |
+| `command_topic` | string | `/motor_effort_controller/commands` | Effort command output topic |
+| `joint_name` | string | `motor_joint` | Joint name inside `/joint_states.name[]` |
+| `rate_hz` | double | `100.0` | Control-loop frequency (Hz) |
+
+#### Runtime-reconfigurable
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `control_mode` | string | `cascade` | Active control mode: `position_only`, `cascade`, or `velocity_only` |
+| `amplitude_rad_s` | double | `0.0` | Sine trajectory amplitude (rad/s in velocity_only; rad in cascade/position_only). `0.0` = stationary. |
+| `omega_rad_s` | double | `0.0` | Sine angular frequency (rad/s). For 1 Hz use `2π ≈ 6.283`. `0.0` = stationary. |
+| `position_setpoint` | double | `0.0` | Static position setpoint (rad). Sine oscillates around this value. |
+| `kp` | double | `0.35` | Inner-loop proportional gain |
+| `ki` | double | `0.01` | Inner-loop integral gain |
+| `kd` | double | `0.0` | Inner-loop derivative gain |
+| `kff` | double | `0.40` | Velocity feedforward gain (suppressed when `kp=0`) |
+| `kaff` | double | `0.0` | Acceleration feedforward gain (suppressed when `kp=0`) |
+| `torque_limit_nm` | double | `0.40` | Output torque saturation limit (N·m) |
+| `integral_limit` | double | `0.0` | Inner-loop integral clamp. Must be positive to take effect. |
+| `deadband_rad_s` | double | `0.0` | Velocity error deadband |
+| `kp_pos` | double | `2.0` | Outer-loop proportional gain |
+| `ki_pos` | double | `0.01` | Outer-loop integral gain |
+| `kd_pos` | double | `0.025` | Outer-loop derivative gain |
+| `pos_integral_limit` | double | `1.0` | Outer-loop integral clamp (must be positive) |
+| `pos_output_limit` | double | `2.0` | Max velocity command from the outer loop (rad/s) |
+| `outer_loop_divider` | double | `1.0` | Run outer loop every N inner-loop ticks |
+| `filter_alpha` | double | `0.90` | Velocity EMA smoothing coefficient (`[0.0, 1.0)`) |
+| `invert_output` | bool | `false` | Negate torque and flip measured signs |
+
+---
+
+## Troubleshooting
+
+### 1) CAN interface down / no traffic
+Symptoms:
+- No `/joint_states` updates (or they remain zero/NaN)
+- `candump can0` shows nothing
+
+Checks/fixes:
+- `ip -details link show can0`
+- confirm bitrate matches the bus
+- check wiring and termination
+- confirm the ODrive is powered and connected
+
+### 2) Wrong ODrive node ID
+Symptoms:
+- CAN is up, but hardware plugin never gets valid feedback / joint stays NaN
+
+Fix:
+- Update `node_id` values in `description/urdf/motor.urdf.xacro` to match the ODrive CAN node IDs
+
+### 3) Controllers not active
+Symptoms:
+- PID publishes torque commands but motor doesn't respond
+- `/motor_effort_controller/commands` exists but effort interface not claimed
+
+Checks:
+```bash
+ros2 control list_controllers
+ros2 control list_hardware_interfaces
+```
+
+Fix:
+- make sure `motor_effort_controller` is `active` (spawner should do this)
+- verify controller manager is running and reachable at `/controller_manager`
+
+### 4) Effort controller type not available
+Symptoms:
+- controller fails to load with a type-not-found error
+
+Checks:
+```bash
+ros2 control list_controller_types
+```
+
+Fix:
+- install `ros-jazzy-ros2-controllers` (or equivalent)
+- update `config/controllers.yaml` to use an effort controller type that exists on your system
+
+### 5) ODrive not in a state that accepts torque commands
+Symptoms:
+- feedback exists but motor does not move/respond
+
+Fix:
+- ensure the ODrive is calibrated/configured for closed-loop control
+- confirm it accepts CAN setpoints as expected for your ODrive firmware/config
+
+---
+
+## Phase 2 (planned)
+
+Phase 2 will add a **pluggable PTO control framework** for comparing WEC control strategies on the same hardware bench:
+
+| Strategy | Law |
+|---|---|
+| Passive damping (baseline) | `τ = -B·ω` |
+| Optimal passive | `τ = -B_opt·ω` (B_opt matches radiation damping) |
+| Reactive (complex conjugate) | `τ = -B·ω - K·x` |
+| Latching | Lock shaft at extremes, release at optimal phase |
+| Declutching | Free shaft periodically, engage at optimal phase |
+| MPC | Model-predictive with wave prediction horizon |
+
+---
+
+## Licensing / vendored code
+
+The `src/odrive_base/` and `src/odrive_ros2_control/` packages are sourced from the upstream [`odriverobotics/ros_odrive`](https://github.com/odriverobotics/ros_odrive) repository and retain its MIT license.
+
+Provenance and update notes are documented in:
+
+- [`VENDORED.md`](VENDORED.md)
