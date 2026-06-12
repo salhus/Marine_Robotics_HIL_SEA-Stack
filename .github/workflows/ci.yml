@@ -6,6 +6,9 @@ on:
   pull_request:
     branches: [main]
 
+permissions:
+  contents: read
+
 jobs:
   build-check:
     name: Build sanity check (ROS 2 Jazzy, no Chrono)
@@ -21,7 +24,8 @@ jobs:
         run: |
           apt-get update
           rosdep update
-          rosdep install --from-paths src/repo -y --ignore-src             --skip-keys="chrono seastack ament_cmake_chrono"
+          rosdep install --from-paths src/repo -y --ignore-src \
+            --skip-keys="chrono seastack ament_cmake_chrono"
 
       - name: Build packages that don't require Chrono
         shell: bash
@@ -29,7 +33,13 @@ jobs:
           source /opt/ros/jazzy/setup.bash
           # Only build ros2_control-side packages that have no Chrono dependency.
           # chrono_flap_sim is intentionally skipped (requires Chrono + optionally SEA-Stack/VSG).
-          colcon build --packages-select             odrive_base             odrive_ros2_control             odrive_velocity_pid             hil_torque_mixer             hil_odrive_ros2_control             --event-handlers console_direct+
+          colcon build --packages-select \
+            odrive_base \
+            odrive_ros2_control \
+            odrive_velocity_pid \
+            hil_torque_mixer \
+            hil_odrive_ros2_control \
+            --event-handlers console_direct+
 
       - name: Verify build succeeded
         shell: bash
