@@ -169,16 +169,24 @@ target_include_directories(chrono_flap_node PRIVATE
 target_link_libraries(chrono_flap_node ${LIBS})
 
 # ─── SEA-Stack integration (optional) ──────────────────────────────────────────
-# Only enabled when SEAStack_DIR points to a valid build/install tree.
-# Without SEA-Stack, the node still compiles cleanly and SEA-Stack code paths
-# are completely absent (CHRONO_FLAP_USE_SEASTACK is not defined).
-find_package(SEAStack QUIET CONFIG)
+# Only enabled when SEAStack_DIR points to a valid build/install tree, OR
+# when CMAKE_PREFIX_PATH (CMake var OR env var) contains the SEA-Stack install
+# prefix. colcon does not auto-populate the CMake var from the env var, so we
+# re-inject it here, matching the VSG-discovery pattern above.
+set(_seastack_search_prefixes ${CMAKE_PREFIX_PATH})
+if(DEFINED ENV{CMAKE_PREFIX_PATH})
+  file(TO_CMAKE_PATH "$ENV{CMAKE_PREFIX_PATH}" _seastack_env_prefixes)
+  list(APPEND _seastack_search_prefixes ${_seastack_env_prefixes})
+endif()
+list(REMOVE_DUPLICATES _seastack_search_prefixes)
+
+find_package(SEAStack QUIET CONFIG PATHS ${_seastack_search_prefixes})
 if(SEAStack_FOUND)
   message(STATUS "chrono_flap_sim: Found SEA-Stack at ${SEAStack_DIR}")
   message(STATUS "chrono_flap_sim: Compiling with CHRONO_FLAP_USE_SEASTACK")
   target_sources(chrono_flap_node PRIVATE src/sea_stack_hydro.cpp)
   target_compile_definitions(chrono_flap_node PRIVATE CHRONO_FLAP_USE_SEASTACK)
-  target_link_libraries(chrono_flap_node PRIVATE
+  target_link_libraries(chrono_flap_node
     SEAStack::ChronoAdapter
     SEAStack::Hydro
     SEAStack::HydroIO
@@ -188,7 +196,7 @@ if(SEAStack_FOUND)
 else()
   message(STATUS
     "chrono_flap_sim: SEA-Stack NOT found — node will compile WITHOUT hydrodynamics. "
-    "To enable, export SEAStack_DIR=<path/to/SEA-Stack/build> and rebuild.")
+    "To enable, export SEAStack_DIR=<path/to/SEA-Stack/install/lib/cmake/SEAStack> and rebuild.")
 endif()
 # ────────────────────────────────────────────────────────────────────────────────
 
