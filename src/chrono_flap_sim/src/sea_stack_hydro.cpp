@@ -31,6 +31,8 @@ struct SeaStackHydroAdapter::Impl
   std::shared_ptr<seastack::hydro::WaveBase> wave_model;
   std::unique_ptr<seastack::hydro::HydroModel> hydro_model;
   std::unique_ptr<seastack::chrono::ChronoHydroCoupler> coupler;
+  unsigned int hydro_accum_idx{0};
+  bool accum_allocated{false};
   double torque_clip_nm{0.2};
 };
 
@@ -96,6 +98,12 @@ SeaStackHydroAdapter::SeaStackHydroAdapter(
   impl_->hydro_model = std::make_unique<seastack::hydro::HydroModel>(std::move(model));
   impl_->coupler = std::make_unique<seastack::chrono::ChronoHydroCoupler>(
     impl_->hydro_model->GetForces(), bodies);
+
+  // Allocate a dedicated wrench accumulator on the flap body for SEA-Stack
+  // hydro torque. Using a per-source accumulator (vs SetAppliedTorque) lets
+  // Chrono's solver track this force separately and clear it each substep.
+  impl_->hydro_accum_idx = impl_->flap_body->AddAccumulator();
+  impl_->accum_allocated = true;
 }
 
 SeaStackHydroAdapter::~SeaStackHydroAdapter() = default;
@@ -120,9 +128,15 @@ HydroStepResult SeaStackHydroAdapter::step(double sim_time, double dt)
     impl_->torque_clip_nm);
   result.was_clipped = (result.torque_raw_nm != result.torque_clip_nm);
 
-  impl_->flap_body->Accumulate_torque(
-    ::chrono::ChVector3d(0.0, result.torque_clip_nm, 0.0),
-    false);
+  if (impl_->accum_allocated) {
+    // Reset and re-apply this tick's contribution to the dedicated accumulator
+    // (parent-frame torque about Y, the flap pivot axis).
+    impl_->flap_body->EmptyAccumulator(impl_->hydro_accum_idx);
+    impl_->flap_body->AccumulateTorque(
+      impl_->hydro_accum_idx,
+      ::chrono::ChVector3d(0.0, result.torque_clip_nm, 0.0),
+      /*local=*/false);
+  }
 
   if (impl_->wave_model) {
     const auto p = impl_->flap_body->GetPos();

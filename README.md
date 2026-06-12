@@ -331,6 +331,19 @@ export VSG_FILE_PATH=/usr/local/share/chrono/data:$HOME/Packages/vsg/share/vsgEx
 Then a normal `colcon build` will pick everything up — no extra
 `--cmake-args` are needed.
 
+### Quickstart (Chrono + SEA-Stack + VSG)
+
+For a one-command env setup that covers Chrono, SEA-Stack, and VSG:
+
+```bash
+source scripts/setup_env.sh
+colcon build --packages-select chrono_flap_sim
+```
+
+See [`docs/sea-stack-integration.md`](docs/sea-stack-integration.md) for the
+full integration guide, troubleshooting, and the (intentional) ~100% clip
+behaviour when running OSWEC-scale BEM on the bench.
+
 To rebuild a single package after making changes:
 
 ```bash
