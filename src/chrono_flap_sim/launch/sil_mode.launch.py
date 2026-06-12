@@ -61,6 +61,30 @@ def generate_launch_description():
 
     declared_arguments.append(
         DeclareLaunchArgument(
+            "seastack_h5_path",
+            default_value="",
+            description="Path to SEA-Stack BEM .h5 file. Empty disables SEA-Stack.",
+        )
+    )
+
+    declared_arguments.append(
+        DeclareLaunchArgument(
+            "wave_hs_m",
+            default_value="0.0",
+            description="JONSWAP significant wave height in meters (0.0 = calm sea).",
+        )
+    )
+
+    declared_arguments.append(
+        DeclareLaunchArgument(
+            "hydro_torque_clip_nm",
+            default_value="0.2",
+            description="Hard clip for SEA-Stack torque before Chrono application (N·m).",
+        )
+    )
+
+    declared_arguments.append(
+        DeclareLaunchArgument(
             "enable_rviz",
             default_value="true",
             description="Launch RViz2 for 3D visualization.",
@@ -92,6 +116,9 @@ def generate_launch_description():
     enable_rviz = LaunchConfiguration("enable_rviz")
     rviz_config = LaunchConfiguration("rviz_config")
     plotjuggler_layout = LaunchConfiguration("plotjuggler_layout")
+    seastack_h5_path = LaunchConfiguration("seastack_h5_path")
+    wave_hs_m = LaunchConfiguration("wave_hs_m")
+    hydro_torque_clip_nm = LaunchConfiguration("hydro_torque_clip_nm")
 
     robot_description_content = Command(
         [
@@ -120,6 +147,9 @@ def generate_launch_description():
             "mode": "sil",
             "bearing_friction": bearing_friction,
             "enable_visualization": enable_visualization,
+            "seastack_h5_path": seastack_h5_path,
+            "wave_hs_m": wave_hs_m,
+            "hydro_torque_clip_nm": hydro_torque_clip_nm,
         }],
         output="both",
     )
@@ -172,4 +202,3 @@ def generate_launch_description():
             rviz_node,
         ]
     )
-

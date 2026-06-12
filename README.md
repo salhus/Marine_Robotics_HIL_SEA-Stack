@@ -2,7 +2,7 @@
 
 
 
-This is the SEA-Stack-integrated variant of the [original repo](https://github.com/salhus/Marine_Robotics_HIL_Project_Chrono_ROS2-Controls); the SEA-Stack integration itself is pending in a follow-up PR.
+This is the SEA-Stack-integrated variant of the [original repo](https://github.com/salhus/Marine_Robotics_HIL_Project_Chrono_ROS2-Controls). SEA-Stack hydrodynamics is wired into `chrono_flap_node` via the `seastack_h5_path` parameter (opt-in by default). See [`docs/sea-stack-integration.md`](docs/sea-stack-integration.md) for the full pipeline, telemetry topics, and safety story.
 
 A self-contained **ROS 2 Jazzy** workspace implementing a **Wave Energy Converter (WEC) Hardware-in-the-Loop (HIL) dynamometer** test bench using two ODrive motors on a shared shaft, controlled over **SocketCAN (CAN bus)** via **ros2_control**.
 
@@ -725,6 +725,7 @@ Phase 2 will add a **pluggable PTO control framework** for comparing WEC control
 
 - [`docs/VSG_SETUP.md`](docs/VSG_SETUP.md) — Vulkan Scene Graph (VSG) 3D visualizer: install, env-var setup, troubleshooting matrix
 - [`docs/local-chrono-build.md`](docs/local-chrono-build.md) — Building against a local Chrono tree (no `sudo make install`); env-var setup required for SEA-Stack interop with `CH_USE_SIMD=OFF`
+- [`docs/sea-stack-integration.md`](docs/sea-stack-integration.md) — SEA-Stack hydrodynamics integration: pipeline, parameters, engage gate, telemetry, troubleshooting
 - [`src/chrono_flap_sim/README.md`](src/chrono_flap_sim/README.md) — Project Chrono flap simulation: physics model, SIL vs parallel modes, all parameters, published topics, and build instructions
 - [`src/hil_odrive_ros2_control/README.md`](src/hil_odrive_ros2_control/README.md) — hardware launch, URDF configuration, CAN node ID setup, and detailed controller bring-up steps
 - [`src/odrive_velocity_pid/README.md`](src/odrive_velocity_pid/README.md) — cascaded PID node: control modes, all parameters, published topics, and safety features

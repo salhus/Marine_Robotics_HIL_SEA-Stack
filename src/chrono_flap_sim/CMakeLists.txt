@@ -168,6 +168,30 @@ target_include_directories(chrono_flap_node PRIVATE
 
 target_link_libraries(chrono_flap_node ${LIBS})
 
+# ─── SEA-Stack integration (optional) ──────────────────────────────────────────
+# Only enabled when SEAStack_DIR points to a valid build/install tree.
+# Without SEA-Stack, the node still compiles cleanly and SEA-Stack code paths
+# are completely absent (CHRONO_FLAP_USE_SEASTACK is not defined).
+find_package(SEAStack QUIET CONFIG)
+if(SEAStack_FOUND)
+  message(STATUS "chrono_flap_sim: Found SEA-Stack at ${SEAStack_DIR}")
+  message(STATUS "chrono_flap_sim: Compiling with CHRONO_FLAP_USE_SEASTACK")
+  target_sources(chrono_flap_node PRIVATE src/sea_stack_hydro.cpp)
+  target_compile_definitions(chrono_flap_node PRIVATE CHRONO_FLAP_USE_SEASTACK)
+  target_link_libraries(chrono_flap_node PRIVATE
+    SEAStack::ChronoAdapter
+    SEAStack::Hydro
+    SEAStack::HydroIO
+    SEAStack::Core
+    SEAStack::Infra
+  )
+else()
+  message(STATUS
+    "chrono_flap_sim: SEA-Stack NOT found — node will compile WITHOUT hydrodynamics. "
+    "To enable, export SEAStack_DIR=<path/to/SEA-Stack/build> and rebuild.")
+endif()
+# ────────────────────────────────────────────────────────────────────────────────
+
 ament_target_dependencies(chrono_flap_node
   rclcpp
   std_msgs

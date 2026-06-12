@@ -27,7 +27,9 @@
 //   τ_total = τ_cmd − (B_joint + B_bearing)·ω − C_coulomb·sign(ω) − K·θ
 //
 #include <chrono>
+#include <algorithm>
 #include <cmath>
+#include <deque>
 #include <functional>
 #include <memory>
 #include <set>
@@ -37,7 +39,7 @@
 #include "std_msgs/msg/float64.hpp"
 #include "std_msgs/msg/float64_multi_array.hpp"
 #include "sensor_msgs/msg/joint_state.hpp"
-#include "std_srvs/srv/set_bool.hpp"
+#include "std_srvs/srv/set_bool.hpp"  // for ~/enable_hydro service
 // Project Chrono headers
 #include "chrono/physics/ChSystemNSC.h"
 #include "chrono/physics/ChBody.h"
@@ -58,6 +60,9 @@
 #endif
 // Shadow PID controller (reuses PidController from odrive_velocity_pid)
 #include "chrono_flap_sim/shadow_pid_controller.hpp"
+#if defined(CHRONO_FLAP_USE_SEASTACK)
+#  include "chrono_flap_sim/sea_stack_hydro.hpp"
+#endif
 
 using namespace chrono;
 
@@ -150,6 +155,15 @@ public:
     this->declare_parameter<bool>  ("hil_engaged_default",      false);
     this->declare_parameter<std::string>("hil_load_topic",      "~/load_torque");
 
+    // ── SEA-Stack hydrodynamics parameters ────────────────────────────────────────────────────
+    this->declare_parameter<std::string>("seastack_h5_path", "");
+    this->declare_parameter<double>("hydro_torque_clip_nm", 0.2);
+    this->declare_parameter<double>("wave_hs_m", 0.0);
+    this->declare_parameter<double>("wave_tp_s", 4.0);
+    this->declare_parameter<int>("wave_seed", 42);
+    this->declare_parameter<int>("wave_n_components", 50);
+    this->declare_parameter<bool>("hydro_engaged_default", false);
+
     // ── Read parameters ───────────────────────────────────────────────────────────────────────
     // Resolve mode: prefer explicit `mode` param; fall back to sil_mode bool.
     const std::string mode_param = this->get_parameter("mode").as_string();
@@ -215,6 +229,14 @@ public:
     hil_engaged_            = this->get_parameter("hil_engaged_default").as_bool();
     hil_load_topic_         = this->get_parameter("hil_load_topic").as_string();
 
+    seastack_h5_path_      = this->get_parameter("seastack_h5_path").as_string();
+    hydro_torque_clip_nm_  = this->get_parameter("hydro_torque_clip_nm").as_double();
+    wave_hs_m_             = this->get_parameter("wave_hs_m").as_double();
+    wave_tp_s_             = this->get_parameter("wave_tp_s").as_double();
+    wave_seed_             = this->get_parameter("wave_seed").as_int();
+    wave_n_components_     = this->get_parameter("wave_n_components").as_int();
+    hydro_engaged_         = this->get_parameter("hydro_engaged_default").as_bool();
+
     if (mode_ == "hil") {
       if (use_shadow_pid_) {
         RCLCPP_INFO(this->get_logger(),
@@ -230,6 +252,39 @@ public:
     substeps_   = std::max(1, static_cast<int>(std::round(publish_dt_ / solver_dt_)));
 
     build_chrono_system();
+
+#if defined(CHRONO_FLAP_USE_SEASTACK)
+    if (!seastack_h5_path_.empty()) {
+      try {
+        chrono_flap_sim::SeaStackHydroParams p;
+        p.h5_path           = seastack_h5_path_;
+        p.wave_hs_m         = wave_hs_m_;
+        p.wave_tp_s         = wave_tp_s_;
+        p.wave_seed         = wave_seed_;
+        p.wave_n_components = wave_n_components_;
+        p.torque_clip_nm    = hydro_torque_clip_nm_;
+        hydro_adapter_ = std::make_unique<chrono_flap_sim::SeaStackHydroAdapter>(
+          sys_.get(), flap_, base_body_, p);
+        RCLCPP_INFO(this->get_logger(),
+          "SEA-Stack hydro ENABLED: h5='%s', Hs=%.2fm, Tp=%.2fs, clip=±%.3fNm. "
+          "Engage with: ros2 service call ~/enable_hydro std_srvs/srv/SetBool \"{data: true}\"",
+          seastack_h5_path_.c_str(), wave_hs_m_, wave_tp_s_, hydro_torque_clip_nm_);
+      } catch (const std::exception & e) {
+        RCLCPP_ERROR(this->get_logger(),
+          "SEA-Stack hydro init FAILED: %s. Hydro will be disabled for this run.", e.what());
+        hydro_adapter_.reset();
+      }
+    } else {
+      RCLCPP_INFO(this->get_logger(),
+        "SEA-Stack hydro DISABLED (seastack_h5_path is empty).");
+    }
+#else
+    if (!seastack_h5_path_.empty()) {
+      RCLCPP_WARN(this->get_logger(),
+        "seastack_h5_path='%s' provided but this node was built WITHOUT SEA-Stack "
+        "(CHRONO_FLAP_USE_SEASTACK not defined). Ignoring.", seastack_h5_path_.c_str());
+    }
+#endif
 
     // ── ROS interfaces ────────────────────────────────────────────────────────────────────────
     if (mode_ != "hil") {
@@ -248,6 +303,10 @@ public:
     vel_pub_          = this->create_publisher<std_msgs::msg::Float64>("~/sim_velocity",     10);
     accel_pub_        = this->create_publisher<std_msgs::msg::Float64>("~/sim_acceleration", 10);
     shadow_torque_pub_ = this->create_publisher<std_msgs::msg::Float64>("~/shadow_torque",   10);
+    hydro_torque_raw_pub_       = this->create_publisher<std_msgs::msg::Float64>("~/hydro_torque_raw", 10);
+    hydro_torque_pub_           = this->create_publisher<std_msgs::msg::Float64>("~/hydro_torque", 10);
+    wave_elevation_pub_         = this->create_publisher<std_msgs::msg::Float64>("~/wave_elevation", 10);
+    hydro_clip_engaged_pct_pub_ = this->create_publisher<std_msgs::msg::Float64>("~/hydro_clip_engaged_pct", 10);
 
     if (mode_ == "sil") {
       joint_state_pub_ = this->create_publisher<sensor_msgs::msg::JointState>(
@@ -298,6 +357,17 @@ public:
         "Engage via: ros2 service call ~/engage_hil std_srvs/srv/SetBool \"{data: true}\"",
         hil_load_topic_.c_str());
     }
+
+    enable_hydro_service_ = this->create_service<std_srvs::srv::SetBool>(
+      "~/enable_hydro",
+      [this](
+        const std_srvs::srv::SetBool::Request::SharedPtr req,
+        std_srvs::srv::SetBool::Response::SharedPtr res) {
+        hydro_engaged_ = req->data;
+        res->success = true;
+        res->message = hydro_engaged_ ? "SEA-Stack hydro torque ENGAGED" : "SEA-Stack hydro torque DISENGAGED";
+        RCLCPP_INFO(this->get_logger(), "%s", res->message.c_str());
+      });
 
     // Trajectory sync — works in SIL and Parallel modes only
     if (shadow_sync_trajectory_ && mode_ != "hil") {
@@ -384,6 +454,10 @@ public:
       // Determine torque command for this tick
       double torque_cmd = 0.0;
       double shadow_torque = 0.0;
+      double hydro_torque_applied = 0.0;
+      double hydro_torque_raw = 0.0;
+      double wave_eta = 0.0;
+      bool hydro_was_clipped = false;
 
       if (mode_ == "hil") {
         // ── HIL path ──────────────────────────────────────────────────────────────────────────
@@ -409,6 +483,22 @@ public:
         double tau_hydro = 0.0;
         if (feedback_ok) {
           tau_hydro = compute_load_torque(hw_pos_, hw_vel_, t);
+#if defined(CHRONO_FLAP_USE_SEASTACK)
+          if (hydro_adapter_ && hydro_engaged_) {
+            // SEA-Stack replaces the stub in HIL mode.
+            // NOTE: in HIL mode, the adapter is given measured hardware state, not Chrono state.
+            // The flap_ Chrono body is updated each tick from hw_pos_/hw_vel_ above; SEA-Stack
+            // reads its position/velocity through the Chrono body interface as usual.
+            flap_->SetRot(::chrono::QuatFromAngleAxis(hw_pos_, ::chrono::ChVector3d(0, 1, 0)));
+            flap_->SetAngVelParent(::chrono::ChVector3d(0, hw_vel_, 0));
+            auto r = hydro_adapter_->step(t, publish_dt_);
+            tau_hydro = r.torque_clip_nm;
+            hydro_torque_raw = r.torque_raw_nm;
+            hydro_torque_applied = r.torque_clip_nm;
+            wave_eta = r.wave_eta_m;
+            hydro_was_clipped = r.was_clipped;
+          }
+#endif
 
           // Ramp gate
           if (hil_engaged_) {
@@ -433,6 +523,7 @@ public:
         std_msgs::msg::Float64 load_msg;
         load_msg.data = tau_hydro;
         hil_load_pub_->publish(load_msg);
+        publish_hydro_telemetry(hydro_torque_raw, hydro_torque_applied, wave_eta, hydro_was_clipped);
 
         // Update sim state from hardware measurements (no Chrono integration)
         const double prev_vel = sim_velocity_;
@@ -464,6 +555,22 @@ public:
         } else {
           torque_cmd = latest_torque_;
         }
+
+        // ── SEA-Stack hydrodynamics contribution (SIL/Parallel) ────────────────
+#if defined(CHRONO_FLAP_USE_SEASTACK)
+        if (hydro_adapter_ && hydro_engaged_) {
+          const double t = (this->now() - start_time_).seconds();
+          auto r = hydro_adapter_->step(t, publish_dt_);
+          hydro_torque_raw = r.torque_raw_nm;
+          hydro_torque_applied = r.torque_clip_nm;
+          wave_eta = r.wave_eta_m;
+          hydro_was_clipped = r.was_clipped;
+          // The adapter already calls Accumulate_torque internally — DON'T add to torque_cmd here.
+        }
+#endif
+
+        // Publish telemetry (always, even when disabled — gives zeros)
+        publish_hydro_telemetry(hydro_torque_raw, hydro_torque_applied, wave_eta, hydro_was_clipped);
 
         // Record velocity before sub-stepping for acceleration estimate
         const double vel_before = sim_velocity_;
@@ -516,11 +623,20 @@ private:
     sys_->AddBody(ground_);
 
     flap_ = std::make_shared<ChBody>();
+    flap_->SetName("body1");
     update_flap_inertia();
     flap_vis_shape_ = std::make_shared<ChVisualShapeBox>(
       kFlapVisDepth, flap_width_, flap_length_);
     flap_->AddVisualShape(flap_vis_shape_);
     sys_->AddBody(flap_);
+
+    base_body_ = std::make_shared<ChBody>();
+    base_body_->SetName("body2");
+    base_body_->SetPos(ChVector3d(0.0, 0.0, 0.0));
+    base_body_->SetFixed(true);
+    base_body_->SetMass(1e-6);
+    base_body_->SetInertiaXX(ChVector3d(1e-9, 1e-9, 1e-9));
+    sys_->AddBody(base_body_);
 
     motor_link_ = std::make_shared<ChLinkMotorRotationTorque>();
     torque_fn_  = std::make_shared<ChFunctionSetpoint>();
@@ -629,7 +745,8 @@ private:
 
   static inline const std::set<std::string> kImmutableParams = {
     "rate_hz", "solver_rate_hz", "effort_topic", "sil_mode", "mode",
-    "joint_name", "joint_state_topic", "hil_load_topic"};
+    "joint_name", "joint_state_topic", "hil_load_topic", "seastack_h5_path",
+    "wave_hs_m", "wave_tp_s", "wave_seed", "wave_n_components", "hydro_engaged_default"};
 
   rcl_interfaces::msg::SetParametersResult on_validate_parameters(
     const std::vector<rclcpp::Parameter> & parameters)
@@ -698,7 +815,7 @@ private:
 
       // HIL: strict positive
       static const std::set<std::string> kHilPositiveParams = {
-        "hil_torque_clip_nm", "hil_feedback_timeout_s"};
+        "hil_torque_clip_nm", "hil_feedback_timeout_s", "hydro_torque_clip_nm"};
       if (kHilPositiveParams.count(param.get_name())) {
         if (param.get_type() != rclcpp::ParameterType::PARAMETER_DOUBLE || param.as_double() <= 0.0) {
           result.successful = false;
@@ -754,6 +871,14 @@ private:
       else if (n == "hil_torque_clip_nm")     { hil_torque_clip_nm_     = param.as_double(); }
       else if (n == "hil_feedback_timeout_s") { hil_feedback_timeout_s_ = param.as_double(); }
       else if (n == "hil_ramp_time_s")        { hil_ramp_time_s_        = param.as_double(); }
+      else if (n == "hydro_torque_clip_nm") {
+        hydro_torque_clip_nm_ = param.as_double();
+#if defined(CHRONO_FLAP_USE_SEASTACK)
+        if (hydro_adapter_) {
+          hydro_adapter_->set_torque_clip(hydro_torque_clip_nm_);
+        }
+#endif
+      }
     }
 
     if (body_needs_update) {
@@ -794,6 +919,23 @@ private:
     pub_f64(vel_pub_,           sim_velocity_);
     pub_f64(accel_pub_,         sim_acceleration_);
     pub_f64(shadow_torque_pub_, shadow_torque);
+  }
+
+  void publish_hydro_telemetry(double raw, double clipped, double eta, bool was_clipped)
+  {
+    std_msgs::msg::Float64 m;
+    m.data = raw;     hydro_torque_raw_pub_->publish(m);
+    m.data = clipped; hydro_torque_pub_->publish(m);
+    m.data = eta;     wave_elevation_pub_->publish(m);
+
+    // Rolling 100-tick clip-engaged percentage
+    clip_engaged_history_.push_back(was_clipped ? 1 : 0);
+    if (clip_engaged_history_.size() > 100) clip_engaged_history_.pop_front();
+    int count = 0;
+    for (int v : clip_engaged_history_) count += v;
+    m.data = 100.0 * static_cast<double>(count) /
+             static_cast<double>(std::max<size_t>(1, clip_engaged_history_.size()));
+    hydro_clip_engaged_pct_pub_->publish(m);
   }
 
   void publish_joint_state()
@@ -876,6 +1018,7 @@ private:
   std::unique_ptr<ChSystemNSC>               sys_;
   std::shared_ptr<ChBody>                    ground_;
   std::shared_ptr<ChBody>                    flap_;
+  std::shared_ptr<::chrono::ChBody>          base_body_;
   std::shared_ptr<ChLinkMotorRotationTorque> motor_link_;
   std::shared_ptr<ChFunctionSetpoint>        torque_fn_;
   std::shared_ptr<ChVisualShapeBox>          flap_vis_shape_;
@@ -893,9 +1036,14 @@ private:
   rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr              accel_pub_;
   rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr              shadow_torque_pub_;
   rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr              hil_load_pub_;
+  rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr              hydro_torque_raw_pub_;
+  rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr              hydro_torque_pub_;
+  rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr              wave_elevation_pub_;
+  rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr              hydro_clip_engaged_pct_pub_;
   rclcpp::Publisher<sensor_msgs::msg::JointState>::SharedPtr        joint_state_pub_;
   rclcpp::Publisher<sensor_msgs::msg::JointState>::SharedPtr        sim_joint_state_pub_;
   rclcpp::Service<std_srvs::srv::SetBool>::SharedPtr                engage_service_;
+  rclcpp::Service<std_srvs::srv::SetBool>::SharedPtr                enable_hydro_service_;
 
   // HIL state
   double       hil_constant_load_nm_{0.1};
@@ -910,6 +1058,20 @@ private:
   bool         hil_engaged_{false};
   double       hil_ramp_start_time_{0.0};
   std::string  hil_load_topic_{"~/load_torque"};
+
+  // SEA-Stack hydrodynamics
+  std::string seastack_h5_path_;
+  double      hydro_torque_clip_nm_{0.2};
+  double      wave_hs_m_{0.0};
+  double      wave_tp_s_{4.0};
+  int         wave_seed_{42};
+  int         wave_n_components_{50};
+  bool        hydro_engaged_{false};
+  std::deque<int> clip_engaged_history_;
+#if defined(CHRONO_FLAP_USE_SEASTACK)
+  std::unique_ptr<chrono_flap_sim::SeaStackHydroAdapter> hydro_adapter_;
+#endif
+
   // Hardware measurements (from /joint_states in HIL mode)
   double       hw_pos_{0.0};
   double       hw_vel_{0.0};
