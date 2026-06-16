@@ -190,3 +190,54 @@ SEA-Stack reads the WEC-Sim/BEMIO H5 schema. Brief reference:
 ## 🏁 Honest claim, as of `4ea782d` on `2026-06-12`
 
 > SEA-Stack hydrodynamic forces are integrated into the ROS 2 + Chrono pipeline (verified in SIL with OSWEC BEM: 1,261 linked symbols, full topic flow, parameterized launch, service-gated engagement, with clip-engagement behavior matching design intent). The node is a fully-instrumented professional controls bench — cascade PID with feedforward, runtime-tunable via `rqt_reconfigure`, live-observable via PlotJuggler + RViz2 + Chrono VSG. Build reproduces from clean clone via `setup_env.sh + colcon build`. HIL packages compile and HIL launch artifacts exist on the same code path; full HIL validation with live motors is queued for once bench-scale BEM (Capytaine on toy flap) is available.
+
+---
+
+## 📝 Operational lessons from 2026-06-16 SIL bring-up
+
+Four days after the end-of-week status above, a fresh SIL bring-up session rediscovered several operational gotchas not previously documented. These are not bugs in the verified SIL pipeline — that pipeline still works exactly as `2026-06-12` reported. They are workflow / DX issues worth capturing so future sessions do not lose time on them again.
+
+Full bring-up procedure now lives in [`docs/hil_bringup_checklist.md`](docs/hil_bringup_checklist.md). Highlights:
+
+### Three-gate model (not previously written down explicitly)
+
+SEA-Stack reaching the Chrono body (SIL) or the motor (HIL) passes through three gates, only the last of which is the runtime engage service:
+
+| # | Gate | Type | Controls |
+|---|---|---|---|
+| 1 | `CHRONO_FLAP_USE_SEASTACK` | Build-time | Whether SEA-Stack is compiled in at all |
+| 2 | `seastack_h5_path != ""` | Launch-time | Whether the adapter and wave field are constructed |
+| 3 | `~/enable_hydro` | Runtime | Whether `τ_hydro` is published as non-zero |
+
+HIL adds a fourth runtime gate, `~/engage_hil`, gating the mixer's load input independently.
+
+Practical implication: `hydro_torque_raw = 0.0` after launch can mean any of three different problems. Check the `chrono_flap_node` startup banner (`SEA-Stack hydro ENABLED / DISABLED / FAILED / built WITHOUT SEA-Stack`) to identify which gate is closed.
+
+### `ros2 service call` from the launching terminal hangs
+
+Single-threaded executor + VSG render + 1 kHz solver + 8 publishers can starve the service callback queue. Calling `/chrono_flap_node/enable_hydro` from the same shell that started the launch can sit indefinitely at "waiting for service to become available...". Calling from a separate terminal completes in milliseconds.
+
+Fix (not in this PR): switch to `MultiThreadedExecutor` with a dedicated service callback group. ~15 LOC.
+
+### Frozen-at-construction parameters look mutable but are not
+
+`wave_hs_m`, `wave_tp_s`, `wave_seed`, `wave_n_components`, `hydro_torque_clip_nm`, `seastack_h5_path` all show up in `rqt_reconfigure` and accept `ros2 param set` writes (the parameter value updates), but the wave field and adapter are constructed once and never rebuilt. To change any of these, kill the launch and relaunch.
+
+Documentation discrepancy worth fixing: `docs/sea-stack-integration.md` §8 lists `hydro_torque_clip_nm` as runtime-mutable, but the current implementation freezes it in the adapter constructor. Either the doc or the code needs to change. Not in scope for this PR.
+
+### `hydro_torque_raw = 0.0` with adapter loaded is not necessarily broken
+
+If the body is stationary AND `wave_hs_m = 0.0`, all four hydro components genuinely evaluate to ~0. Easiest fix: set `amplitude_rad_s = 0.1`, `omega_rad_s = 1.0` on `/velocity_pid_node` via `rqt_reconfigure` to start the body moving. Radiation + hydrostatic terms become non-zero immediately. For an obvious wave-driven signal, relaunch with `wave_hs_m:=0.05`.
+
+### Suggested follow-up PRs from this session
+
+These augment the existing "Optional consolidation PRs" list above and are similarly low priority:
+
+- `MultiThreadedExecutor` + service callback group in `chrono_flap_node` (~15 LOC). Fixes the service-hang from the launching terminal.
+- Make wave parameters live-reconfigurable by rebuilding the wave field inside an `on_apply_parameters` branch (~50 LOC). Enables wave-sweep experiments without relaunching.
+- Reconcile `hydro_torque_clip_nm` mutability between code and `sea-stack-integration.md` §8 (either implement the runtime swap or update the doc — pick one).
+- `~/hydro_status` topic publishing a single-byte enum (`DISABLED_NO_H5` / `DISABLED_BUILD` / `DISABLED_GATE` / `ENGAGED`) so the next `hydro_torque_raw = 0` debugging session takes one `ros2 topic echo` instead of digging through startup logs.
+
+---
+
+*Appended 2026-06-16 (Denver / MDT). See [`docs/hil_bringup_checklist.md`](docs/hil_bringup_checklist.md) for the full HIL bring-up procedure.*

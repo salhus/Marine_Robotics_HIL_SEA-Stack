@@ -739,6 +739,7 @@ Phase 2 will add a **pluggable PTO control framework** for comparing WEC control
 - [`docs/VSG_SETUP.md`](docs/VSG_SETUP.md) — Vulkan Scene Graph (VSG) 3D visualizer: install, env-var setup, troubleshooting matrix
 - [`docs/local-chrono-build.md`](docs/local-chrono-build.md) — Building against a local Chrono tree (no `sudo make install`); env-var setup required for SEA-Stack interop with `CH_USE_SIMD=OFF`
 - [`docs/sea-stack-integration.md`](docs/sea-stack-integration.md) — SEA-Stack hydrodynamics integration: pipeline, parameters, engage gate, telemetry, troubleshooting
+- [`docs/hil_bringup_checklist.md`](docs/hil_bringup_checklist.md) — staged HIL bring-up procedure with the two-gate safety model, verification commands per stage, and the "common gotchas" learned during the 2026-06-16 SIL bring-up
 - [`src/chrono_flap_sim/README.md`](src/chrono_flap_sim/README.md) — Project Chrono flap simulation: physics model, SIL vs parallel modes, all parameters, published topics, and build instructions
 - [`src/hil_odrive_ros2_control/README.md`](src/hil_odrive_ros2_control/README.md) — hardware launch, URDF configuration, CAN node ID setup, and detailed controller bring-up steps
 - [`src/odrive_velocity_pid/README.md`](src/odrive_velocity_pid/README.md) — cascaded PID node: control modes, all parameters, published topics, and safety features
